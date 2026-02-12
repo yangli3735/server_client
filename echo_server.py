@@ -8,130 +8,22 @@ import errno
 ECHO_PORT = 9999
 BUF_SIZE = 4096
 
+READ_FLAGS = select.EPOLLIN | select.EPOLLHUP | select.EPOLLERR
+READ_WRITE_FLAGS = select.EPOLLIN | select.EPOLLOUT | select.EPOLLHUP | select.EPOLLERR
 
-def main():
-    print("----- Echo Server (epoll) -----")
 
-    # 1) Create listening socket
-    serverSock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    serverSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    serverSock.bind(("0.0.0.0", ECHO_PORT))
-    serverSock.listen(128)
-    serverSock.setblocking(False)
-
-    # 2) Create epoll object and register the listening socket for read events
-    ep = select.epoll()
-    ep.register(serverSock.fileno(), select.EPOLLIN)
-
-    # fd -> socket
-    conns = {}
-    # fd -> bytearray (pending data to send)
-    outbuf = {}
-
+def safe_unregister(ep, fd):
     try:
-        while True:
-            events = ep.poll(1)  # timeout=1s; adjust as needed
-            for fd, ev in events:
-                if fd == serverSock.fileno():
-                    # Accept as many connections as are ready
-                    while True:
-                        try:
-                            conn, addr = serverSock.accept()
-                            conn.setblocking(False)
-                            cfd = conn.fileno()
-                            conns[cfd] = conn
-                            outbuf[cfd] = bytearray()
-                            # Start by listening for read; we'll add write when needed
-                            ep.register(cfd, select.EPOLLIN | select.EPOLLHUP | select.EPOLLERR)
-                        except BlockingIOError:
-                            break
-                        except OSError as e:
-                            # If accept fails for transient reasons, stop accepting this round
-                            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                                break
-                            raise
-
-                else:
-                    conn = conns.get(fd)
-                    if conn is None:
-                        continue
-
-                    # Handle hangup/error first
-                    if ev & (select.EPOLLHUP | select.EPOLLERR):
-                        cleanup(ep, conns, outbuf, fd)
-                        continue
-
-                    # Read ready
-                    if ev & select.EPOLLIN:
-                        while True:
-                            try:
-                                data = conn.recv(BUF_SIZE)
-                                if not data:
-                                    # Client closed
-                                    cleanup(ep, conns, outbuf, fd)
-                                    break
-                                # Echo: queue data to send back
-                                outbuf[fd].extend(data)
-                            except BlockingIOError:
-                                break
-                            except OSError as e:
-                                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                                    break
-                                cleanup(ep, conns, outbuf, fd)
-                                break
-
-                        # If we have something to send, enable EPOLLOUT
-                        if fd in conns and outbuf.get(fd):
-                            ep.modify(fd, select.EPOLLIN | select.EPOLLOUT | select.EPOLLHUP | select.EPOLLERR)
-
-                    # Write ready
-                    if ev & select.EPOLLOUT:
-                        buf = outbuf.get(fd)
-                        if not buf:
-                            # Nothing left to send; stop listening for write
-                            if fd in conns:
-                                ep.modify(fd, select.EPOLLIN | select.EPOLLHUP | select.EPOLLERR)
-                            continue
-
-                        while buf:
-                            try:
-                                sent = conn.send(buf)
-                                if sent == 0:
-                                    cleanup(ep, conns, outbuf, fd)
-                                    break
-                                del buf[:sent]
-                            except BlockingIOError:
-                                break
-                            except OSError as e:
-                                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                                    break
-                                cleanup(ep, conns, outbuf, fd)
-                                break
-
-                        # If fully sent, stop listening for write
-                        if fd in conns and not outbuf[fd]:
-                            ep.modify(fd, select.EPOLLIN | select.EPOLLHUP | select.EPOLLERR)
-
-    finally:
-        # Cleanup all
-        try:
-            ep.unregister(serverSock.fileno())
-        except Exception:
-            pass
-        ep.close()
-        for fd in list(conns.keys()):
-            cleanup(None, conns, outbuf, fd)
-        serverSock.close()
+        ep.unregister(fd)
+    except Exception:
+        pass
 
 
 def cleanup(ep, conns, outbuf, fd):
     sock = conns.pop(fd, None)
     outbuf.pop(fd, None)
     if ep is not None:
-        try:
-            ep.unregister(fd)
-        except Exception:
-            pass
+        safe_unregister(ep, fd)
     if sock is not None:
         try:
             sock.close()
@@ -139,5 +31,123 @@ def cleanup(ep, conns, outbuf, fd):
             pass
 
 
-if __name__ == "__main__":
-    main()
+def try_flush(ep, conns, outbuf, fd):
+    """Try to send as much as possible from outbuf[fd] without blocking."""
+    sock = conns.get(fd)
+    if sock is None:
+        return
+
+    buf = outbuf.get(fd)
+    if not buf:
+        # nothing pending; only need read notifications
+        try:
+            ep.modify(fd, READ_FLAGS)
+        except Exception:
+            pass
+        return
+
+    while buf:
+        try:
+            sent = sock.send(buf)
+            if sent == 0:
+                cleanup(ep, conns, outbuf, fd)
+                return
+            del buf[:sent]
+        except BlockingIOError:
+            break
+        except OSError as e:
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                break
+            cleanup(ep, conns, outbuf, fd)
+            return
+
+    # If still pending, listen for EPOLLOUT; otherwise, back to read-only.
+    if fd in conns:
+        try:
+            ep.modify(fd, READ_WRITE_FLAGS if outbuf[fd] else READ_FLAGS)
+        except Exception:
+            pass
+
+
+def main():
+    print("----- Echo Server (epoll) -----")
+
+    serverSock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    serverSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    serverSock.bind(("0.0.0.0", ECHO_PORT))
+    serverSock.listen(256)
+    serverSock.setblocking(False)
+
+    ep = select.epoll()
+    ep.register(serverSock.fileno(), select.EPOLLIN)
+
+    conns = {}          # fd -> socket
+    outbuf = {}         # fd -> bytearray
+
+    try:
+        while True:
+            # Short poll interval helps reduce latency under stress
+            events = ep.poll(0.05)
+
+            for fd, ev in events:
+                if fd == serverSock.fileno():
+                    # accept all ready connections
+                    while True:
+                        try:
+                            conn, _ = serverSock.accept()
+                            conn.setblocking(False)
+                            cfd = conn.fileno()
+                            conns[cfd] = conn
+                            outbuf[cfd] = bytearray()
+                            ep.register(cfd, READ_FLAGS)
+                        except BlockingIOError:
+                            break
+                        except OSError as e:
+                            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                                break
+                            raise
+                    continue
+
+                sock = conns.get(fd)
+                if sock is None:
+                    continue
+
+                if ev & (select.EPOLLHUP | select.EPOLLERR):
+                    cleanup(ep, conns, outbuf, fd)
+                    continue
+
+                if ev & select.EPOLLIN:
+                    # read all available data
+                    while True:
+                        try:
+                            data = sock.recv(BUF_SIZE)
+                            if not data:
+                                cleanup(ep, conns, outbuf, fd)
+                                break
+                            outbuf[fd].extend(data)
+                        except BlockingIOError:
+                            break
+                        except OSError as e:
+                            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                                break
+                            cleanup(ep, conns, outbuf, fd)
+                            break
+
+                    # immediately try to send back
+                    if fd in conns:
+                        try_flush(ep, conns, outbuf, fd)
+
+                if ev & select.EPOLLOUT:
+                    # socket writable; flush pending
+                    try_flush(ep, conns, outbuf, fd)
+
+    finally:
+        try:
+            safe_unregister(ep, serverSock.fileno())
+        except Exception:
+            pass
+        ep.close()
+        for fd in list(conns.keys()):
+            cleanup(None, conns, outbuf, fd)
+        serverSock.close()
+
