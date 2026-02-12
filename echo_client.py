@@ -1,7 +1,7 @@
 import socket
 import argparse
 
-ECHO_PORT = localhost
+ECHO_PORT = 9999
 BUF_SIZE = 4096
 
 def main():
