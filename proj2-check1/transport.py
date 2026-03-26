@@ -39,25 +39,44 @@ class ReadMode:
     TIMEOUT = 2
 
 class Packet:
-    def __init__(self, seq=0, ack=0, flags=0, window=0, payload=b""):
+    BASE_HEADER_FORMAT = "!IIBHII"  # seq(32), ack(32), flags(8), window(16), sack_left(32), sack_right(32)
+    BASE_HEADER_SIZE = struct.calcsize(BASE_HEADER_FORMAT)
+
+    def __init__(self, seq=0, ack=0, flags=0, window=0, payload=b"", sack_left=0, sack_right=0):
         self.seq = seq
         self.ack = ack
         self.flags = flags
         self.window = window
         self.payload = payload
+        self.sack_left = sack_left
+        self.sack_right = sack_right
 
     def encode(self):
-        # Encode the packet header and payload into bytes
-        header = struct.pack("!IIIIH", self.seq, self.ack, self.flags, self.window, len(self.payload))
+        # Encode base header fields to match project packet format.
+        header = struct.pack(
+            self.BASE_HEADER_FORMAT,
+            self.seq,
+            self.ack,
+            self.flags & 0xFF,
+            self.window & 0xFFFF,
+            self.sack_left,
+            self.sack_right,
+        )
+
         return header + self.payload
 
     @staticmethod
     def decode(data):
         # Decode bytes into a Packet object
-        header_size = struct.calcsize("!IIIIH")
-        seq, ack, flags, window, payload_len = struct.unpack("!IIIIH", data[:header_size])
-        payload = data[header_size:]
-        return Packet(seq, ack, flags, window, payload)
+        if len(data) < Packet.BASE_HEADER_SIZE:
+            raise ValueError("Packet too short for header")
+
+        seq, ack, flags, window, sack_left, sack_right = struct.unpack(
+            Packet.BASE_HEADER_FORMAT,
+            data[:Packet.BASE_HEADER_SIZE],
+        )
+        payload = data[Packet.BASE_HEADER_SIZE:]
+        return Packet(seq, ack, flags, window, payload, sack_left=sack_left, sack_right=sack_right)
 
 
 class TransportSocket:
@@ -113,21 +132,11 @@ class TransportSocket:
     def _buffered_receive_bytes(self):
         return self.window["recv_len"] + self.out_of_order_bytes
 
-    def _serialize_sack_blocks(self, sack_blocks):
-        payload = bytearray()
-        for start, end in sack_blocks:
-            payload.extend(struct.pack("!II", start, end))
-        return bytes(payload)
-
-    def _parse_sack_blocks(self, payload):
-        block_size = struct.calcsize("!II")
-        usable_length = len(payload) - (len(payload) % block_size)
-        sack_blocks = []
-        for offset in range(0, usable_length, block_size):
-            start, end = struct.unpack("!II", payload[offset : offset + block_size])
-            if start < end:
-                sack_blocks.append((start, end))
-        return sack_blocks
+    def _parse_sack_blocks(self, sack_left, sack_right):
+        start, end = sack_left, sack_right
+        if start < end:
+            return [(start, end)]
+        return []
 
     def _current_sack_blocks_locked(self):
         merged_blocks = []
@@ -137,20 +146,26 @@ class TransportSocket:
                 merged_blocks[-1] = (merged_blocks[-1][0], max(merged_blocks[-1][1], end))
             else:
                 merged_blocks.append((seq, end))
-        return merged_blocks
+        if not merged_blocks:
+            return []
+        # Keep only one block to satisfy the one-SACK-block format.
+        return [merged_blocks[0]]
 
     def _current_advertised_window(self):
         return max(0, MAX_NETWORK_BUFFER - self._buffered_receive_bytes())
 
     def _send_ack_packet(self, ack_val=None, addr=None, include_sack=False):
         sack_blocks = self._current_sack_blocks_locked() if include_sack else []
+        sack_left, sack_right = (sack_blocks[0] if sack_blocks else (0, 0))
         flags = ACK_FLAG | (SACK_FLAG if sack_blocks else 0)
         packet = Packet(
             seq=self.window["next_seq_to_send"],
             ack=self.window["last_ack"] if ack_val is None else ack_val,
             flags=flags,
             window=self._current_advertised_window(),
-            payload=self._serialize_sack_blocks(sack_blocks),
+            payload=b"",
+            sack_left=sack_left,
+            sack_right=sack_right,
         )
         self.sock_fd.sendto(packet.encode(), self.conn if addr is None else addr)
 
@@ -210,15 +225,65 @@ class TransportSocket:
                 info["sacked"] = True
 
     def _retransmit_segment_locked(self, seq, reason):
-        info = self.unacked_segments.get(seq)
+        target_seq = seq
+        info = self.unacked_segments.get(target_seq)
+
+        # Fast retransmit may be triggered by ACK value (next expected byte),
+        # which points inside a missing segment rather than exactly at its start.
         if info is None:
-            return False
+            containing = [
+                (seg_seq, seg_info)
+                for seg_seq, seg_info in self.unacked_segments.items()
+                if seg_seq <= seq < (seg_seq + seg_info["len"])
+            ]
+            if containing:
+                target_seq, info = min(containing, key=lambda item: item[0])
+            else:
+                return False
 
         self.sock_fd.sendto(info["packet"].encode(), self.conn)
         info["last_tx"] = time.time()
         info["retransmitted"] = True
-        log_with_timestamp(f"{reason}: retransmitting segment seq={seq}, len={info['len']}")
+        log_with_timestamp(f"{reason}: retransmitting segment seq={target_seq}, len={info['len']}")
         self._log_flow_state("fast-retransmit")
+        return True
+
+    def _send_fin_locked(self, next_state, reason):
+        fin_seq = self.window["next_seq_to_send"]
+        fin_packet = Packet(
+            seq=fin_seq,
+            ack=self.window["last_ack"],
+            flags=FIN_FLAG,
+            window=self._current_advertised_window(),
+        )
+        self.sock_fd.sendto(fin_packet.encode(), self.conn)
+        self.unacked_segments[fin_seq] = {
+            "packet": fin_packet,
+            "len": 1,
+            "first_tx": time.time(),
+            "last_tx": time.time(),
+            "retransmitted": False,
+            "sacked": False,
+            "is_fin": True,
+        }
+        self.window["next_seq_to_send"] += 1
+        self._set_state(next_state)
+        log_with_timestamp(f"{reason}: sent FIN seq={fin_seq}")
+
+    def _retransmit_fin_if_needed_locked(self):
+        fin_candidates = [
+            (seq, info)
+            for seq, info in self.unacked_segments.items()
+            if info.get("is_fin")
+        ]
+        if not fin_candidates:
+            return False
+
+        fin_seq, fin_info = min(fin_candidates, key=lambda item: item[0])
+        self.sock_fd.sendto(fin_info["packet"].encode(), self.conn)
+        fin_info["last_tx"] = time.time()
+        fin_info["retransmitted"] = True
+        log_with_timestamp(f"Timeout: retransmitting FIN seq={fin_seq}")
         return True
 
     def _segment_overlaps_buffered_data_locked(self, seq, payload_len):
@@ -362,46 +427,32 @@ class TransportSocket:
             log_with_timestamp("Error: Null socket")
             return EXIT_ERROR
 
-        wait_for_peer = False
-        wait_timeout = None
-
         with self.recv_lock:
             if self.state == STATE_ESTABLISHED:
-                log_with_timestamp("Sending FIN")
-                self._send_control_packet(FIN_FLAG)
-                self.window["next_seq_to_send"] += 1
-                self._set_state(STATE_FIN_SENT)
-                wait_for_peer = True
+                self._send_fin_locked(STATE_FIN_SENT, "Active close")
             elif self.state == STATE_CLOSE_WAIT:
-                log_with_timestamp("Sending FIN from CLOSE_WAIT")
-                self._send_control_packet(FIN_FLAG)
-                self.window["next_seq_to_send"] += 1
-                self._set_state(STATE_LAST_ACK)
-                wait_for_peer = True
-            elif self.state == STATE_TIME_WAIT:
-                wait_for_peer = True
-                if self.time_wait_deadline is not None:
-                    wait_timeout = max(0, self.time_wait_deadline - time.time())
+                self._send_fin_locked(STATE_LAST_ACK, "Passive close")
             elif self.state in {STATE_LISTEN, STATE_CLOSED}:
                 self._set_state(STATE_CLOSED)
             elif self.state == STATE_SYN_SENT:
                 self._set_state(STATE_CLOSED)
 
-        if wait_for_peer:
-            self._wait_for_state({STATE_TIME_WAIT, STATE_CLOSED}, timeout=DEFAULT_TIMEOUT)
+        # Reliable FIN handling: retransmit FIN while waiting for ACK/state progress.
+        with self.recv_lock:
+            while self.state in {STATE_FIN_SENT, STATE_LAST_ACK}:
+                if not self.wait_cond.wait(timeout=self.retransmission_timeout):
+                    self._retransmit_fin_if_needed_locked()
 
-            with self.recv_lock:
-                if self.state == STATE_TIME_WAIT:
-                    if wait_timeout is None and self.time_wait_deadline is not None:
-                        wait_timeout = max(0, self.time_wait_deadline - time.time())
-                    if wait_timeout is None:
-                        wait_timeout = TIME_WAIT_DURATION
+            if self.state == STATE_TIME_WAIT:
+                if self.time_wait_deadline is None:
+                    self.time_wait_deadline = time.time() + TIME_WAIT_DURATION
 
-            self._wait_for_state({STATE_CLOSED}, timeout=wait_timeout)
-
-            with self.recv_lock:
-                if self.state == STATE_TIME_WAIT:
-                    self._set_state(STATE_CLOSED)
+                while self.state == STATE_TIME_WAIT:
+                    remaining = self.time_wait_deadline - time.time()
+                    if remaining <= 0:
+                        self._set_state(STATE_CLOSED)
+                        break
+                    self.wait_cond.wait(timeout=remaining)
 
         self.death_lock.acquire()
         try:
@@ -448,10 +499,18 @@ class TransportSocket:
             with self.wait_cond:
                 while self.window["recv_len"] == 0 and self.state not in {STATE_CLOSE_WAIT, STATE_LAST_ACK, STATE_TIME_WAIT, STATE_CLOSED}:
                     self.wait_cond.wait()
+        elif flags == ReadMode.TIMEOUT:
+            with self.wait_cond:
+                deadline = time.time() + self.retransmission_timeout
+                while self.window["recv_len"] == 0 and self.state not in {STATE_CLOSE_WAIT, STATE_LAST_ACK, STATE_TIME_WAIT, STATE_CLOSED}:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    self.wait_cond.wait(timeout=remaining)
 
         self.recv_lock.acquire()
         try:
-            if flags in [ReadMode.NO_WAIT, ReadMode.NO_FLAG]:
+            if flags in [ReadMode.NO_WAIT, ReadMode.NO_FLAG, ReadMode.TIMEOUT]:
                 if self.window["recv_len"] > 0:
                     read_len = min(self.window["recv_len"], length)
                     buf[0] = self.window["recv_buf"][:read_len]
@@ -603,7 +662,7 @@ class TransportSocket:
                 if self.conn is None:
                     self.conn = addr
 
-                if packet.flags == (SYN_FLAG | ACK_FLAG):
+                if (packet.flags & (SYN_FLAG | ACK_FLAG)) == (SYN_FLAG | ACK_FLAG):
                     with self.recv_lock:
                         if self.state == STATE_SYN_SENT:
                             self.window["last_ack"] = packet.seq + 1
@@ -644,7 +703,7 @@ class TransportSocket:
                 # If it's an ACK packet, update our sending side
                 if (packet.flags & ACK_FLAG) != 0:
                     with self.recv_lock:
-                        sack_blocks = self._parse_sack_blocks(packet.payload) if (packet.flags & SACK_FLAG) != 0 else []
+                        sack_blocks = self._parse_sack_blocks(packet.sack_left, packet.sack_right) if (packet.flags & SACK_FLAG) != 0 else []
                         prev_peer_window = self.window["peer_advertised_window"]
                         self.window["peer_advertised_window"] = max(0, min(MAX_NETWORK_BUFFER, packet.window))
                         self._update_sacked_segments(sack_blocks)
@@ -710,6 +769,13 @@ class TransportSocket:
                         self.window["last_ack"] = packet.seq + payload_len
                         self._drain_contiguous_out_of_order_locked()
                         self._log_flow_state("recv-buffered")
+                        
+                        # BUG FIX #1: If server is in SYN_RCVD and receives valid data,
+                        # the handshake must have succeeded on the client side.
+                        # Transition to ESTABLISHED so server can send data too.
+                        if self.state == STATE_SYN_RCVD:
+                            log_with_timestamp("Received data in SYN_RCVD state, transitioning to ESTABLISHED")
+                            self._set_state(STATE_ESTABLISHED)
 
                     with self.wait_cond:
                         self.wait_cond.notify_all()
@@ -755,6 +821,9 @@ class TransportSocket:
                         log_with_timestamp(
                             f"Duplicate old packet: seq={packet.seq}, expected={self.window['last_ack']}"
                         )
+                        # BUG FIX #2: MUST send ACK for old/duplicate segments so that
+                        # retransmitted data from the sender triggers our cumulative ACK,
+                        # allowing it to advance its send window and stop retransmitting.
                         self._send_ack_packet(
                             ack_val=self.window["last_ack"],
                             addr=addr,
