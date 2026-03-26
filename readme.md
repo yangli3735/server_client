@@ -25,40 +25,69 @@ This project implements a simplified TCP protocol over UDP sockets with the foll
 - **SACK Semantics**: One block per ACK; dual ACK support for old/duplicate segments enables retransmission loop prevention
 - **Deadlines**: TIME_WAIT duration is 2 × DEFAULT_TIMEOUT seconds
 
+## Program Environment
+
+**Python Version**: Python 3.6 or higher
+- Uses f-string formatting and socket/threading APIs available in Python 3.6+
+
+**Linux Kernel**: Modern Linux distribution (e.g., Linux 5.x or later)
+- Required for `tc` (traffic control) command when testing with network conditions
+- Uses standard UDP socket APIs (POSIX-compatible)
+
+**Dependencies**: None (standard library only)
+- `socket`: UDP communication
+- `struct`: Binary packet encoding/decoding
+- `threading`: Concurrent server and client handling
+- `time`: RTT measurement and timeout management
+- `random`, `string`: Test data generation
+
 ## How to Run
 
-1. **Setup**: Navigate to the project folder:
-   ```bash
-   project2-checkpoint1
-   ```
+option1 
+1. Go to the project runtime folder:
+    Run server and client in separate terminals:
+	- Terminal 1:
+	  python3 server.py
+	- Terminal 2:
+	  python3 client.py
 
 
-2. **Run server and client in separate terminals**:
-   ```bash
-   # Terminal 1: Start server
-   python3 server.py
+2. Run the following command in terminal3: 
+
+    sudo tc qdisc add dev lo root netem delay 50ms  loss 5%
    
-   # Terminal 2: Start client
-   python3 client.py
-   ```
+   Change different delay and loss variables to test different conditions. 
 
-3. **Optional: Test under network conditions** (requires `sudo` for tc):
-   ```bash
-   bash simulate_loss_delay.sh 
-   ```
-   - This applies 50ms delay + 20% loss to loopback interface
-   - Starts server in background, runs client, then cleans up tc rules on exit
-   - Edit `DELAY` and `LOSS` variables in the script to test different scenarios
+3. Restoring Normal Network Conditions 
 
-### Network Condition Reference
+    When you’re finished testing, remove the network emulation with: 
+    sudo tc qdisc del dev lo root netem 
+
+Option2
+ run with simulated delay/loss (uses sudo tc on loopback interface lo):
+
+Edit `DELAY` and `LOSS` at the top of `simulate_loss_delay.sh`, then rerun:
+
+bash simulate_loss_delay.sh
+
+```bash
+DELAY="50ms"   # change this
+LOSS="5%"      # change this
+```
+
+### Scenario Reference
 
 | Scenario            | DELAY   | LOSS  | Manual tc command                                          |
 |---------------------|---------|-------|------------------------------------------------------------|
-| Baseline            | `0ms`   | `0%`  | *(no rule needed)*                                         |
-| Low delay           | `50ms`  | `0%`  | `sudo tc qdisc add dev lo root netem delay 50ms`           |
-| High delay          | `200ms` | `0%`  | `sudo tc qdisc add dev lo root netem delay 200ms`          |
-| Low loss            | `0ms`   | `5%`  | `sudo tc qdisc add dev lo root netem loss 5%`              |
-| Medium loss         | `0ms`   | `10%` | `sudo tc qdisc add dev lo root netem loss 10%`             |
-| High loss           | `0ms`   | `20%` | `sudo tc qdisc add dev lo root netem loss 20%`             |
-| Delay + loss        | `50ms`  | `5%`  | `sudo tc qdisc add dev lo root netem delay 50ms loss 5%`   |
-| Harsh conditions    | `200ms` | `20%` | `sudo tc qdisc add dev lo root netem delay 200ms loss 20%` |
+| 1. Baseline         | `0ms`   | `0%`  | *(no tc rule needed)*                                      |
+| 2. Low delay        | `50ms`  | `0%`  | `sudo tc qdisc add dev lo root netem delay 50ms`           |
+| 3. High delay       | `200ms` | `0%`  | `sudo tc qdisc add dev lo root netem delay 200ms`          |
+| 4. Low loss         | `0ms`   | `5%`  | `sudo tc qdisc add dev lo root netem loss 5%`              |
+| 5. Medium loss      | `0ms`   | `10%` | `sudo tc qdisc add dev lo root netem loss 10%`             |
+| 6. High loss        | `0ms`   | `20%` | `sudo tc qdisc add dev lo root netem loss 20%`             |
+| 7. Delay + loss     | `50ms`  | `5%`  | `sudo tc qdisc add dev lo root netem delay 50ms loss 5%`   |
+| 8. Harsh conditions | `200ms` | `20%` | `sudo tc qdisc add dev lo root netem delay 200ms loss 20%` |
+
+Notes:
+- server.py listens on port 54321.
+- simulate_loss_delay.sh starts server.py in background, then runs client.py, and removes netem settings on exit.
