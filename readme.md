@@ -30,9 +30,4 @@ sudo tc qdisc add dev lo root netem delay 50ms loss 5%
 8.高延迟+高丢包
 200ms + 20%
 
-sudo tc qdisc add dev lo root netem delay 200ms loss 20%
-
-
-每次测试前都先删旧规则：
-
-sudo tc qdisc del dev lo root netem
+ bash simulate_loss_delay.sh

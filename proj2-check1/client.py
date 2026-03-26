@@ -15,7 +15,7 @@ def client_main():
     client_socket.socket(sock_type="TCP_INITIATOR", port=54321, server_ip="127.0.0.1")
 
     # Send a file to the server
-    file_name = "alice.txt"
+    file_name = "large_test.txt"
     with open(file_name, "rb") as f:
         file_data = f.read()
         print(f"Client: Sending file '{file_name}' to the server...")
