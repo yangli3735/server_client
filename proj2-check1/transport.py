@@ -2,7 +2,7 @@ import socket
 import struct
 import threading
 import time  
-from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER
+from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER, WINDOW_INITIAL_WINDOW_SIZE, WINDOW_INITIAL_SSTHRESH
 
 # Constants for simplified TCP
 SYN_FLAG = 0x8   # Synchronization flag 
@@ -25,6 +25,7 @@ STATE_TIME_WAIT = "TIME_WAIT"
 TIME_WAIT_DURATION = 2 * DEFAULT_TIMEOUT
 RTT_ALPHA = 0.875
 MIN_RTO = 0.1
+MAX_RTO = 60.0
 
 
 def log_with_timestamp(message):
@@ -114,6 +115,11 @@ class TransportSocket:
         self.last_duplicate_ack = None
         self.duplicate_ack_count = 0
 
+        # Congestion control state
+        self.cwnd = WINDOW_INITIAL_WINDOW_SIZE
+        self.ssthresh = WINDOW_INITIAL_SSTHRESH
+        self.congestion_state = "slow_start"  # slow_start, congestion_avoidance, fast_recovery
+
     def _set_state(self, new_state):
         if self.state != new_state:
             log_with_timestamp(f"State transition: {self.state} -> {new_state}")
@@ -174,7 +180,8 @@ class TransportSocket:
 
     def _available_send_window(self):
         in_flight = self._in_flight_bytes()
-        return max(0, self.window["peer_advertised_window"] - in_flight)
+        effective_window = min(self.cwnd, self.window["peer_advertised_window"])
+        return max(0, effective_window - in_flight)
 
     def _prune_acked_segments(self):
         acked_seqs = [
@@ -206,7 +213,8 @@ class TransportSocket:
             f"{prefix} | peer_win={self.window['peer_advertised_window']} "
             f"send_base={self.window['send_base']} next_seq={self.window['next_seq_to_send']} "
             f"in_flight={in_flight} recv_len={self.window['recv_len']} ooo_bytes={self.out_of_order_bytes} "
-            f"adv_win={self._current_advertised_window()} rto={self.retransmission_timeout:.3f}s"
+            f"adv_win={self._current_advertised_window()} rto={self.retransmission_timeout:.3f}s "
+            f"cwnd={self.cwnd} ssthresh={self.ssthresh} cc_state={self.congestion_state}"
         )
 
     def _segment_is_sacked(self, seq, segment_len, sack_blocks):
@@ -298,6 +306,80 @@ class TransportSocket:
 
         return False
 
+    def _on_new_ack(self):
+        """Handle new (non-duplicate) ACK for congestion control."""
+        self.last_duplicate_ack = None
+        self.duplicate_ack_count = 0
+        # Reset RTO backoff: restore RTO to value derived from RTT estimate
+        if self.estimated_rtt is not None:
+            self.retransmission_timeout = max(MIN_RTO, 2 * self.estimated_rtt)
+
+        if self.congestion_state == "slow_start":
+            self.cwnd += MSS
+            log_with_timestamp(
+                f"CC slow_start: new ACK, cwnd={self.cwnd}, ssthresh={self.ssthresh}"
+            )
+            if self.cwnd >= self.ssthresh:
+                self.congestion_state = "congestion_avoidance"
+                log_with_timestamp(
+                    f"CC transition: slow_start -> congestion_avoidance "
+                    f"(cwnd={self.cwnd} >= ssthresh={self.ssthresh})"
+                )
+        elif self.congestion_state == "congestion_avoidance":
+            increment = max(1, MSS * MSS // self.cwnd) if self.cwnd > 0 else MSS
+            self.cwnd += increment
+            log_with_timestamp(
+                f"CC congestion_avoidance: new ACK, cwnd={self.cwnd}, ssthresh={self.ssthresh}"
+            )
+        elif self.congestion_state == "fast_recovery":
+            self.cwnd = self.ssthresh
+            self.congestion_state = "congestion_avoidance"
+            log_with_timestamp(
+                f"CC fast_recovery -> congestion_avoidance: new ACK, cwnd={self.cwnd}"
+            )
+
+    def _on_duplicate_ack(self, ack_val):
+        """Handle duplicate ACK for congestion control."""
+        if self.last_duplicate_ack == ack_val:
+            self.duplicate_ack_count += 1
+        else:
+            self.last_duplicate_ack = ack_val
+            self.duplicate_ack_count = 1
+
+        log_with_timestamp(
+            f"Duplicate ACK for {ack_val} count={self.duplicate_ack_count} "
+            f"cc_state={self.congestion_state}"
+        )
+
+        if self.congestion_state in ("slow_start", "congestion_avoidance"):
+            if self.duplicate_ack_count == 3:
+                self.ssthresh = max(self.cwnd // 2, MSS)
+                self.cwnd = self.ssthresh + 3 * MSS
+                self.congestion_state = "fast_recovery"
+                log_with_timestamp(
+                    f"CC -> fast_recovery: ssthresh={self.ssthresh}, cwnd={self.cwnd}"
+                )
+                self._retransmit_segment_locked(ack_val, "Triple dup ACK (fast retransmit)")
+        elif self.congestion_state == "fast_recovery":
+            self.cwnd += MSS
+            log_with_timestamp(
+                f"CC fast_recovery: dup ACK inflating cwnd={self.cwnd}"
+            )
+
+    def _on_congestion_timeout(self):
+        """Handle timeout for congestion control."""
+        self.ssthresh = max(self.cwnd // 2, MSS)
+        self.cwnd = WINDOW_INITIAL_WINDOW_SIZE
+        self.duplicate_ack_count = 0
+        self.last_duplicate_ack = None
+        self.congestion_state = "slow_start"
+        # Exponential backoff: double RTO on each consecutive timeout
+        self.retransmission_timeout = min(self.retransmission_timeout * 2, MAX_RTO)
+        log_with_timestamp(
+            f"CC timeout: ssthresh={self.ssthresh}, cwnd={self.cwnd}, "
+            f"rto={self.retransmission_timeout:.3f}s (backed off), -> slow_start"
+        )
+
     def _drain_contiguous_out_of_order_locked(self):
         drained = 0
         while self.window["last_ack"] in self.out_of_order_segments:
@@ -379,7 +461,7 @@ class TransportSocket:
                 if self.state == STATE_ESTABLISHED:
                     return EXIT_SUCCESS
             log_with_timestamp("Sending SYN")
-            self._send_control_packet(SYN_FLAG, ack=0)
+            self._send_control_packet(SYN_FLAG, seq=0, ack=0)
             with self.recv_lock:
                 self.window["next_seq_to_send"] = 1
             if self._wait_for_state({STATE_ESTABLISHED}, timeout=DEFAULT_TIMEOUT):
@@ -597,26 +679,26 @@ class TransportSocket:
                     log_with_timestamp(f"All data acknowledged up to seq={self.window['send_base']}.")
                     return
 
-                # If we have outstanding data, use oldest segment timer for retransmission.
+                # If we have outstanding data, use oldest unsacked segment timer for retransmission.
                 if self.unacked_segments:
-                    oldest_seq = min(self.unacked_segments.keys())
-                    oldest_info = self.unacked_segments[oldest_seq]
-                    elapsed = time.time() - oldest_info["last_tx"]
+                    unsacked = {
+                        seq: info
+                        for seq, info in self.unacked_segments.items()
+                        if not info.get("sacked", False)
+                    }
+                    if unsacked:
+                        target_seq = min(unsacked.keys())
+                        target_info = unsacked[target_seq]
+                    else:
+                        target_seq = min(self.unacked_segments.keys())
+                        target_info = self.unacked_segments[target_seq]
+
+                    elapsed = time.time() - target_info["last_tx"]
                     remaining = self.retransmission_timeout - elapsed
 
                     if remaining <= 0:
-                        log_with_timestamp("Timeout: retransmitting unacknowledged window.")
-                        retransmitted_any = False
-                        for seq in sorted(self.unacked_segments.keys()):
-                            if self.unacked_segments[seq].get("sacked"):
-                                continue
-                            pkt = self.unacked_segments[seq]["packet"]
-                            self.sock_fd.sendto(pkt.encode(), self.conn)
-                            self.unacked_segments[seq]["last_tx"] = time.time()
-                            self.unacked_segments[seq]["retransmitted"] = True
-                            retransmitted_any = True
-                        if not retransmitted_any and self.window["send_base"] in self.unacked_segments:
-                            self._retransmit_segment_locked(self.window["send_base"], "Timeout fallback")
+                        self._on_congestion_timeout()
+                        self._retransmit_segment_locked(target_seq, "Timeout retransmit (SACK-aware)")
                         self._log_flow_state("retransmit")
                         continue
 
@@ -668,6 +750,9 @@ class TransportSocket:
                             self.window["last_ack"] = packet.seq + 1
                             if packet.ack > self.window["next_seq_expected"]:
                                 self.window["next_seq_expected"] = packet.ack
+                            # SYN consumed seq 0; SYN-ACK acknowledges it
+                            if packet.ack > self.window["send_base"]:
+                                self.window["send_base"] = packet.ack
                             log_with_timestamp("Received SYN-ACK")
                             self._send_ack_packet(ack_val=self.window["last_ack"])
                             self._set_state(STATE_ESTABLISHED)
@@ -685,7 +770,7 @@ class TransportSocket:
                             self.window["next_seq_to_send"] = 1
                             self._set_state(STATE_SYN_RCVD)
                         elif self.state == STATE_SYN_RCVD:
-                            self._send_control_packet(SYN_FLAG | ACK_FLAG, ack=packet.seq + 1, addr=addr)
+                            self._send_control_packet(SYN_FLAG | ACK_FLAG, seq=0, ack=packet.seq + 1, addr=addr)
                     continue
 
                 if (packet.flags & FIN_FLAG) != 0:
@@ -703,6 +788,12 @@ class TransportSocket:
                 # If it's an ACK packet, update our sending side
                 if (packet.flags & ACK_FLAG) != 0:
                     with self.recv_lock:
+                        # Complete three-way handshake before any other processing.
+                        # A pure ACK consumes no sequence space; do NOT advance last_ack here.
+                        if self.state == STATE_SYN_RCVD and packet.ack >= self.window["next_seq_to_send"]:
+                            log_with_timestamp("Received final ACK for handshake")
+                            self._set_state(STATE_ESTABLISHED)
+
                         sack_blocks = self._parse_sack_blocks(packet.sack_left, packet.sack_right) if (packet.flags & SACK_FLAG) != 0 else []
                         prev_peer_window = self.window["peer_advertised_window"]
                         self.window["peer_advertised_window"] = max(0, min(MAX_NETWORK_BUFFER, packet.window))
@@ -713,20 +804,9 @@ class TransportSocket:
                             self.window["next_seq_expected"] = packet.ack
 
                         if ack_advanced:
-                            self.last_duplicate_ack = None
-                            self.duplicate_ack_count = 0
+                            self._on_new_ack()
                         elif packet.ack == self.window["send_base"] and self.window["send_base"] < self.window["next_seq_to_send"]:
-                            if self.last_duplicate_ack == packet.ack:
-                                self.duplicate_ack_count += 1
-                            else:
-                                self.last_duplicate_ack = packet.ack
-                                self.duplicate_ack_count = 1
-
-                            log_with_timestamp(
-                                f"Duplicate ACK for {packet.ack} count={self.duplicate_ack_count}"
-                            )
-                            if self.duplicate_ack_count == 3:
-                                self._retransmit_segment_locked(packet.ack, "Triple duplicate ACK")
+                            self._on_duplicate_ack(packet.ack)
 
                         if prev_peer_window != self.window["peer_advertised_window"]:
                             log_with_timestamp(
@@ -735,10 +815,7 @@ class TransportSocket:
                             self._log_flow_state("peer-window")
                         if sack_blocks:
                             log_with_timestamp(f"Received SACK blocks: {sack_blocks}")
-                        if self.state == STATE_SYN_RCVD and packet.ack >= self.window["next_seq_to_send"]:
-                            log_with_timestamp("Received final ACK for handshake")
-                            self._set_state(STATE_ESTABLISHED)
-                        elif self.state == STATE_FIN_SENT and packet.ack >= self.window["next_seq_to_send"]:
+                        if self.state == STATE_FIN_SENT and packet.ack >= self.window["next_seq_to_send"]:
                             log_with_timestamp("Received ACK for FIN")
                             self._enter_time_wait()
                         elif self.state == STATE_LAST_ACK and packet.ack >= self.window["next_seq_to_send"]:
@@ -748,11 +825,15 @@ class TransportSocket:
                     continue
 
                 # Otherwise, assume it is a data packet
+                # Skip zero-payload packets that don't consume sequence space
+                payload_len = len(packet.payload)
+                if payload_len == 0:
+                    continue
+
                 # Check if the sequence matches our 'last_ack' (in-order data)
                 if packet.seq == self.window["last_ack"]:
                     with self.recv_lock:
                         available = MAX_NETWORK_BUFFER - self._buffered_receive_bytes()
-                        payload_len = len(packet.payload)
 
                         if payload_len > available:
                             log_with_timestamp(
@@ -780,7 +861,7 @@ class TransportSocket:
                     with self.wait_cond:
                         self.wait_cond.notify_all()
 
-                    log_with_timestamp(f"Received segment {packet.seq} with {len(packet.payload)} bytes.")
+                    log_with_timestamp(f"Received segment {packet.seq} with {payload_len} bytes.")
 
                     # Send back an acknowledgment
                     with self.recv_lock:
